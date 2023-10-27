@@ -80,10 +80,12 @@
 
 extern crate num_cpus;
 
+use crossbeam::channel::{self, Receiver, Sender};
+use parking_lot::{Condvar, Mutex};
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+
 use std::thread;
 
 trait FnBox {
@@ -96,7 +98,7 @@ impl<F: FnOnce()> FnBox for F {
     }
 }
 
-type Thunk<'a> = Box<FnBox + Send + 'a>;
+type Thunk<'a> = Box<dyn FnBox + Send + 'a>;
 
 struct Sentinel<'a> {
     shared_data: &'a Arc<ThreadPoolSharedData>,
@@ -279,7 +281,7 @@ impl Builder {
     ///     .build();
     /// ```
     pub fn build(self) -> ThreadPool {
-        let (tx, rx) = channel::<Thunk<'static>>();
+        let (tx, rx) = channel::unbounded::<Thunk<'static>>();
 
         let num_threads = self.num_threads.unwrap_or_else(num_cpus::get);
 
@@ -329,10 +331,7 @@ impl ThreadPoolSharedData {
     /// Notify all observers joining this pool if there is no more work to do.
     fn no_work_notify_all(&self) {
         if !self.has_work() {
-            *self
-                .empty_trigger
-                .lock()
-                .expect("Unable to notify all joining threads");
+            *self.empty_trigger.lock();
             self.empty_condvar.notify_all();
         }
     }
@@ -619,18 +618,19 @@ impl ThreadPool {
         }
 
         let generation = self.shared_data.join_generation.load(Ordering::SeqCst);
-        let mut lock = self.shared_data.empty_trigger.lock().unwrap();
+        let mut lock = self.shared_data.empty_trigger.lock();
 
         while generation == self.shared_data.join_generation.load(Ordering::Relaxed)
             && self.shared_data.has_work()
         {
-            lock = self.shared_data.empty_condvar.wait(lock).unwrap();
+            self.shared_data.empty_condvar.wait(&mut lock);
         }
 
         // increase generation if we are the first thread to come out of the loop
-        self.shared_data.join_generation.compare_and_swap(
+        let _ = self.shared_data.join_generation.compare_exchange(
             generation,
             generation.wrapping_add(1),
+            Ordering::SeqCst,
             Ordering::SeqCst,
         );
     }
@@ -750,10 +750,7 @@ fn spawn_in_pool(shared_data: Arc<ThreadPoolSharedData>) {
                 let message = {
                     // Only lock jobs for the time it takes
                     // to get a job, not run it.
-                    let lock = shared_data
-                        .job_receiver
-                        .lock()
-                        .expect("Worker thread unable to lock job_receiver");
+                    let lock = shared_data.job_receiver.lock();
                     lock.recv()
                 };
 
@@ -930,7 +927,7 @@ mod test {
                     b1.wait();
                 }
 
-                tx.send(1).is_ok();
+                let _ = tx.send(1).is_ok();
             });
         }
 
